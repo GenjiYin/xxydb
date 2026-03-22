@@ -63,6 +63,7 @@ class xxydb:
         partitioning: Optional[str] = "年",
         unique_together: Optional[List[str]] = None,
         rewrite: bool = True,
+        schema: Optional[dict] = None,
     ):
         """
         将 DataFrame 写入存储，支持历史批量和增量更新。
@@ -74,6 +75,8 @@ class xxydb:
             partitioning:     分区粒度，"年" / "月" / "日" / None(不分区)
             unique_together:  主键列表，指定后自动去重；None 则不去重
             rewrite:          True = 保留最新数据(覆盖)；False = 保留旧数据
+            schema:           字段描述，如 {"close": {"desc": "收盘价", "type": "float"}}
+                              未提供时自动从 DataFrame 推断类型
         """
         if date_col not in data.columns:
             raise ValueError(f"日期列 '{date_col}' 不存在于 DataFrame 中")
@@ -85,8 +88,15 @@ class xxydb:
         else:
             part_key = None
 
-        # 更新配置
-        self._ensure_config(id, date_col, part_key, unique_together)
+        # 更新配置（含字段描述）
+        merged_schema = self._infer_schema(data)
+        if schema:
+            for col, info in schema.items():
+                if col in merged_schema:
+                    merged_schema[col].update(info)
+                else:
+                    merged_schema[col] = info
+        self._ensure_config(id, date_col, part_key, unique_together, merged_schema)
 
         df = data.copy()
         df[date_col] = pd.to_datetime(df[date_col])
@@ -158,6 +168,60 @@ class xxydb:
 
         print(f"  [删除] 表 '{id}' 已移除")
 
+    def set_schema(self, id: str, schema: dict):
+        """
+        为已有表设置或更新字段描述，无需重新写入数据。
+
+        参数:
+            id:      表名
+            schema:  字段描述，如 {"close": {"desc": "收盘价", "type": "float"}}
+                     已有字段的描述会被合并更新，新字段会追加。
+        """
+        if id not in self._config:
+            raise ValueError(f"表 '{id}' 不存在")
+        existing = self._config[id].get("schema", {})
+        for col, info in schema.items():
+            if col in existing:
+                existing[col].update(info)
+            else:
+                existing[col] = info
+        self._config[id]["schema"] = existing
+        self._save_config()
+
+    def describe(self, id: str) -> pd.DataFrame:
+        """
+        返回指定表的字段描述信息。
+
+        返回 DataFrame 包含: 字段、物理类型、说明、是否主键。
+        """
+        cfg = self._config.get(id)
+        if cfg is None:
+            raise ValueError(f"表 '{id}' 不存在")
+
+        folder = self.base_dir / id
+        sample = next(folder.rglob("*.parquet"), None)
+        if sample is None:
+            return pd.DataFrame(columns=["字段", "物理类型", "说明", "是否主键"])
+
+        sample_path = str(sample).replace("\\", "/")
+        cols = self._con.execute(
+            f"SELECT name, type FROM parquet_schema('{sample_path}') "
+            "WHERE num_children IS NULL"
+        ).fetchall()
+
+        schema = cfg.get("schema", {})
+        unique_keys = cfg.get("unique_keys", [])
+        rows = []
+        for name, dtype in cols:
+            info = schema.get(name, {})
+            rows.append({
+                "字段": name,
+                "物理类型": dtype,
+                "说明": info.get("desc", ""),
+                "是否主键": name in unique_keys,
+            })
+        return pd.DataFrame(rows)
+
     def close(self):
         """关闭 DuckDB 连接。"""
         self._con.close()
@@ -165,6 +229,14 @@ class xxydb:
     # ──────────────────────────────────────────
     # 内部方法
     # ──────────────────────────────────────────
+
+    @staticmethod
+    def _infer_schema(df: pd.DataFrame) -> dict:
+        """从 DataFrame 自动推断字段类型信息，desc 留空待人工补充。"""
+        schema = {}
+        for col in df.columns:
+            schema[col] = {"type": str(df[col].dtype), "desc": ""}
+        return schema
 
     @staticmethod
     def _partition_key(dt: pd.Timestamp, part_key: str):
@@ -210,17 +282,29 @@ class xxydb:
             json.dump(self._config, f, ensure_ascii=False, indent=4)
 
     def _ensure_config(
-        self, table_id: str, date_col: str, part_key: str, unique_together
+        self, table_id: str, date_col: str, part_key: str, unique_together,
+        schema: Optional[dict] = None,
     ):
-        """如果表不在配置中则自动添加。"""
+        """如果表不在配置中则自动添加；已有表则合并更新 schema。"""
         if table_id not in self._config:
             self._config[table_id] = {
                 "partition_by": part_key,
                 "date_column": date_col,
                 "unique_keys": unique_together or [],
                 "source_folder": table_id,
+                "schema": schema or {},
             }
-            self._save_config()
+        else:
+            # 合并新 schema 到已有配置（新字段追加，已有字段补充）
+            existing = self._config[table_id].get("schema", {})
+            if schema:
+                for col, info in schema.items():
+                    if col in existing:
+                        existing[col].update(info)
+                    else:
+                        existing[col] = info
+            self._config[table_id]["schema"] = existing
+        self._save_config()
 
     def _create_view(self, table_id: str):
         """为指定表创建/刷新 DuckDB 视图。"""

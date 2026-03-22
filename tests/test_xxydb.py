@@ -174,6 +174,94 @@ class TestContextManager:
 # ──────────────────────────────────────────
 
 
+class TestSchema:
+    def test_auto_infer_schema(self, tmp_db, sample_df):
+        """写入时不传 schema，自动推断 dtype 并记录。"""
+        tmp_db.write_data(sample_df, id="bar", date_col="date", partitioning="年",
+                          unique_together=["date", "code"])
+        cfg = tmp_db._config["bar"]
+        assert "schema" in cfg
+        assert "date" in cfg["schema"]
+        assert "code" in cfg["schema"]
+        assert "close" in cfg["schema"]
+        # 自动推断时 desc 为空
+        assert cfg["schema"]["close"]["desc"] == ""
+        # type 应来自 pandas dtype
+        assert cfg["schema"]["close"]["type"] != ""
+
+    def test_write_with_schema(self, tmp_db, sample_df):
+        """写入时传入 schema，desc 应被正确保存。"""
+        schema = {
+            "date": {"desc": "交易日期"},
+            "code": {"desc": "股票代码（6位）"},
+            "close": {"desc": "日收盘价（元）"},
+        }
+        tmp_db.write_data(sample_df, id="bar", date_col="date", partitioning="年",
+                          unique_together=["date", "code"], schema=schema)
+        cfg = tmp_db._config["bar"]["schema"]
+        assert cfg["date"]["desc"] == "交易日期"
+        assert cfg["code"]["desc"] == "股票代码（6位）"
+        assert cfg["close"]["desc"] == "日收盘价（元）"
+        # 自动推断的 type 也应保留
+        assert "type" in cfg["close"]
+
+    def test_set_schema_updates_existing(self, tmp_db, sample_df):
+        """set_schema 可以为已有表补充或更新字段描述。"""
+        tmp_db.write_data(sample_df, id="bar", date_col="date", partitioning="年")
+        # 初始无描述
+        assert tmp_db._config["bar"]["schema"]["close"]["desc"] == ""
+        # 补充描述
+        tmp_db.set_schema("bar", {"close": {"desc": "日收盘价（元）"}})
+        assert tmp_db._config["bar"]["schema"]["close"]["desc"] == "日收盘价（元）"
+        # 原有 type 不丢失
+        assert "type" in tmp_db._config["bar"]["schema"]["close"]
+
+    def test_set_schema_nonexistent_table(self, tmp_db):
+        """对不存在的表调用 set_schema 应报错。"""
+        with pytest.raises(ValueError, match="不存在"):
+            tmp_db.set_schema("ghost", {"x": {"desc": "test"}})
+
+    def test_describe_returns_dataframe(self, tmp_db, sample_df):
+        """describe 返回包含字段描述的 DataFrame。"""
+        schema = {
+            "date": {"desc": "交易日期"},
+            "code": {"desc": "股票代码"},
+            "close": {"desc": "收盘价"},
+        }
+        tmp_db.write_data(sample_df, id="bar", date_col="date", partitioning="年",
+                          unique_together=["date", "code"], schema=schema)
+        desc = tmp_db.describe("bar")
+        assert list(desc.columns) == ["字段", "物理类型", "说明", "是否主键"]
+        assert len(desc) == 3
+        # 检查主键标记
+        code_row = desc[desc["字段"] == "code"].iloc[0]
+        assert code_row["是否主键"] is True
+        assert code_row["说明"] == "股票代码"
+        close_row = desc[desc["字段"] == "close"].iloc[0]
+        assert close_row["是否主键"] is False
+
+    def test_describe_nonexistent_table(self, tmp_db):
+        """对不存在的表调用 describe 应报错。"""
+        with pytest.raises(ValueError, match="不存在"):
+            tmp_db.describe("ghost")
+
+    def test_schema_merge_on_second_write(self, tmp_db):
+        """第二次写入时 schema 应合并，不覆盖已有描述。"""
+        df1 = pd.DataFrame({"date": ["2024-01-01"], "code": ["000001"], "close": [10.0]})
+        schema1 = {"close": {"desc": "收盘价"}}
+        tmp_db.write_data(df1, id="t", date_col="date", partitioning="年", schema=schema1)
+        assert tmp_db._config["t"]["schema"]["close"]["desc"] == "收盘价"
+
+        # 第二次写入，不传 close 的 schema，但传 code 的
+        df2 = pd.DataFrame({"date": ["2024-02-01"], "code": ["000002"], "close": [20.0]})
+        schema2 = {"code": {"desc": "股票代码"}}
+        tmp_db.write_data(df2, id="t", date_col="date", partitioning="年", schema=schema2)
+        # close 的描述应保留
+        assert tmp_db._config["t"]["schema"]["close"]["desc"] == "收盘价"
+        # code 的描述应更新
+        assert tmp_db._config["t"]["schema"]["code"]["desc"] == "股票代码"
+
+
 class TestErrors:
     def test_missing_date_col(self, tmp_db):
         df = pd.DataFrame({"not_date": ["2024-01-01"], "v": [1]})
