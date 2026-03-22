@@ -5,6 +5,8 @@ xxydb — A股轻量数据库封装
 """
 
 import json
+import os
+import re
 import shutil
 from pathlib import Path
 from typing import List, Optional
@@ -25,7 +27,13 @@ class xxydb:
 
     _PART_MAP = {"年": "year", "月": "month", "日": "day"}
 
-    def __init__(self, path: Optional[str] = None):
+    def __init__(
+        self,
+        path: Optional[str] = None,
+        api_key: Optional[str] = None,
+        base_url: Optional[str] = None,
+        model: Optional[str] = None,
+    ):
         self.base_dir = Path(path) if path else Path.cwd()
         self.base_dir.mkdir(parents=True, exist_ok=True)
 
@@ -33,6 +41,9 @@ class xxydb:
         self._db_path = self.base_dir / "stock_database.duckdb"
         self._config = self._load_config()
         self._con = duckdb.connect(str(self._db_path))
+        self._api_key = api_key
+        self._base_url = base_url
+        self._model = model
 
         # 启动时为已有表创建视图
         self._refresh_all_views()
@@ -222,6 +233,67 @@ class xxydb:
             })
         return pd.DataFrame(rows)
 
+    def ask(
+        self,
+        question: str,
+        *,
+        return_df: bool = True,
+        model: Optional[str] = None,
+    ):
+        """
+        用自然语言查询数据库，AI 自动生成 SQL 并执行。
+
+        参数:
+            question:   自然语言问题，如 "2024年收盘价最高的前10只股票"
+            return_df:  True 返回查询结果 DataFrame，False 返回生成的 SQL 字符串
+            model:      模型名称，不传则使用构造函数中指定的模型
+        """
+        try:
+            from openai import OpenAI
+        except ImportError:
+            raise ImportError(
+                "使用 ask() 需要安装 openai，请运行: pip install xxydb[ai]"
+            )
+
+        api_key = self._api_key or os.environ.get("OPENAI_API_KEY")
+        if not api_key:
+            raise ValueError(
+                "未提供 API Key，请通过构造函数参数 api_key "
+                "或环境变量 OPENAI_API_KEY 设置"
+            )
+
+        if not self._config:
+            raise ValueError("数据库中没有任何表，请先写入数据")
+
+        model = model or self._model
+        if not model:
+            raise ValueError(
+                "未指定模型，请通过构造函数参数 model 或 ask(model=...) 设置"
+            )
+
+        system_prompt = self._build_schema_prompt()
+        client_kwargs = {"api_key": api_key}
+        base_url = self._base_url or os.environ.get("OPENAI_BASE_URL")
+        if base_url:
+            client_kwargs["base_url"] = base_url
+        client = OpenAI(**client_kwargs)
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": question},
+            ]
+        )
+
+        raw = resp.choices[0].message.content.strip()
+        sql = self._extract_sql(raw)
+        self._validate_sql(sql)
+
+        if not return_df:
+            return sql
+
+        return self._con.execute(sql).df()
+
     def close(self):
         """关闭 DuckDB 连接。"""
         self._con.close()
@@ -229,6 +301,61 @@ class xxydb:
     # ──────────────────────────────────────────
     # 内部方法
     # ──────────────────────────────────────────
+
+    def _build_schema_prompt(self) -> str:
+        """将所有表的 schema 元数据组装为系统提示词。"""
+        lines = [
+            "你是一个 DuckDB SQL 生成助手。根据用户的自然语言问题，生成准确的 SQL 查询。",
+            "",
+            "可用的表及其字段：",
+        ]
+        for table_id, cfg in self._config.items():
+            lines.append(f"\n## {table_id}")
+            schema = cfg.get("schema", {})
+            unique_keys = cfg.get("unique_keys", [])
+            for col, info in schema.items():
+                dtype = info.get("type", "")
+                desc = info.get("desc", "")
+                pk = " [主键]" if col in unique_keys else ""
+                parts = [f"  - {col}"]
+                if dtype:
+                    parts.append(f"({dtype})")
+                if desc:
+                    parts.append(f": {desc}")
+                if pk:
+                    parts.append(pk)
+                lines.append(" ".join(parts))
+        lines.extend([
+            "",
+            "规则：",
+            "1. 只生成 SELECT 语句（可使用 WITH/CTE），禁止 INSERT/UPDATE/DELETE/DROP 等操作",
+            "2. 只返回纯 SQL，不要添加解释、注释或 markdown 格式",
+            "3. 使用 DuckDB SQL 语法",
+            "4. 日期比较使用标准格式如 '2024-01-01'",
+        ])
+        return "\n".join(lines)
+
+    @staticmethod
+    def _extract_sql(text: str) -> str:
+        """从 AI 返回的文本中提取 SQL 语句（兼容 markdown 代码块）。"""
+        m = re.search(r"```(?:sql)?\s*\n?(.*?)\n?```", text, re.DOTALL)
+        if m:
+            return m.group(1).strip()
+        return text.strip()
+
+    @staticmethod
+    def _validate_sql(sql: str):
+        """校验 SQL 安全性：只允许 SELECT / WITH 开头，禁止修改类操作。"""
+        normalized = sql.strip().upper()
+        if not (normalized.startswith("SELECT") or normalized.startswith("WITH")):
+            raise ValueError(f"AI 生成了非查询语句，已拒绝执行: {sql[:100]}")
+        forbidden = [
+            "INSERT", "UPDATE", "DELETE", "DROP",
+            "ALTER", "CREATE", "TRUNCATE", "REPLACE",
+        ]
+        for kw in forbidden:
+            if re.search(rf"\b{kw}\b", normalized):
+                raise ValueError(f"SQL 包含禁止的操作 '{kw}'，已拒绝执行")
 
     @staticmethod
     def _infer_schema(df: pd.DataFrame) -> dict:

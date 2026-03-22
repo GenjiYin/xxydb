@@ -6,6 +6,9 @@
 
 ```bash
 pip install xxydb
+
+# 如需 AI 自然语言查询功能
+pip install xxydb[ai]
 ```
 
 本地开发安装：
@@ -13,7 +16,7 @@ pip install xxydb
 ```bash
 git clone https://github.com/xxydb/xxydb.git
 cd xxydb
-pip install -e .
+pip install -e ".[ai]"
 ```
 
 ## 快速开始
@@ -22,7 +25,7 @@ pip install -e .
 import pandas as pd
 from xxydb import xxydb
 
-# 初始化（指定数据存储路径）
+# 初始化（指定数据存储路径，AI 参数可选）
 db = xxydb(path="./my_data")
 
 # 写入数据（按年分区）
@@ -106,6 +109,72 @@ print(db.describe("daily_bar"))
 # 2  close      DOUBLE   日收盘价（元）    False
 ```
 
+## AI 自然语言查询
+
+安装 `xxydb[ai]` 后，可以用自然语言直接查询数据，AI 会根据表结构自动生成 SQL 并执行。
+
+支持所有兼容 OpenAI 协议的模型服务商（OpenAI、Deepseek、通义千问、Moonshot、Ollama 等）。
+
+### 基本用法
+
+```python
+db = xxydb(
+    path="./my_data",
+    api_key="sk-xxx",
+    base_url="https://api.deepseek.com",
+    model="deepseek-chat",
+)
+
+# 返回 DataFrame
+df = db.ask("2024年收盘价最高的前10只股票")
+
+# 只返回 SQL，不执行
+sql = db.ask("2024年收盘价最高的前10只股票", return_df=False)
+```
+
+### 配置方式
+
+AI 相关参数（`api_key`、`base_url`、`model`）支持两种配置方式：
+
+**方式一：构造函数传参**
+
+```python
+db = xxydb("./my_data", api_key="sk-xxx", base_url="https://api.deepseek.com", model="deepseek-chat")
+```
+
+**方式二：环境变量**
+
+```bash
+export OPENAI_API_KEY=sk-xxx
+export OPENAI_BASE_URL=https://api.deepseek.com
+```
+
+```python
+db = xxydb("./my_data", model="deepseek-chat")
+```
+
+`ask()` 调用时也可以临时指定 `model` 覆盖默认值：
+
+```python
+df = db.ask("月均成交量排名", model="deepseek-reasoner")
+```
+
+### 提高准确率
+
+AI 依赖表的 schema 信息来理解字段含义。字段描述越完善，生成的 SQL 越准确：
+
+```python
+db.set_schema("daily_bar", {
+    "date":  {"desc": "交易日期"},
+    "code":  {"desc": "股票代码（6位）"},
+    "close": {"desc": "日收盘价（前复权，元）"},
+    "vol":   {"desc": "成交量（手）"},
+})
+
+# schema 完善后，AI 能正确理解"成交量"指的是 vol 列
+df = db.ask("最近一个月日均成交量最大的股票")
+```
+
 ## API 参考
 
 ### `write_data(data, id, date_col="date", partitioning="年", unique_together=None, rewrite=True, schema=None)`
@@ -121,6 +190,16 @@ print(db.describe("daily_bar"))
 | `unique_together` | 主键列表，指定后自动去重；`None` 不去重 |
 | `rewrite` | `True` 保留最新数据（覆盖），`False` 保留旧数据 |
 | `schema` | 字段描述字典，如 `{"close": {"desc": "收盘价"}}` |
+
+### `ask(question, *, return_df=True, model=None)`
+
+用自然语言查询数据库（需安装 `xxydb[ai]`）。
+
+| 参数 | 说明 |
+|------|------|
+| `question` | 自然语言问题 |
+| `return_df` | `True` 返回 DataFrame，`False` 返回生成的 SQL 字符串 |
+| `model` | 模型名称，不传则使用构造函数中指定的模型 |
 
 ### `query(sql)`
 
