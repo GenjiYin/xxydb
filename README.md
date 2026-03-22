@@ -66,6 +66,86 @@ with xxydb(path="./my_data") as db:
 | `"日"` | `table/year=2024/month=01/day=15/data.parquet` |
 | `None` | `table/data.parquet`（不分区） |
 
+## Schema（字段描述）
+
+xxydb 支持为每张表管理字段描述信息，方便记录各列的含义。
+
+### 写入时指定 schema
+
+```python
+schema = {
+    "date":  {"desc": "交易日期"},
+    "code":  {"desc": "股票代码（6位）"},
+    "close": {"desc": "日收盘价（元）"},
+}
+db.write_data(df, id="daily_bar", date_col="date", partitioning="年",
+              unique_together=["date", "code"], schema=schema)
+```
+
+未提供 `schema` 时，会自动从 DataFrame 推断字段类型（`desc` 留空）。手动传入的 `schema` 会与自动推断结果合并，已有字段的描述会被更新，新字段会追加。
+
+### 单独设置 schema
+
+对已有表补充或修改字段描述，无需重新写入数据：
+
+```python
+db.set_schema("daily_bar", {
+    "close": {"desc": "日收盘价（前复权，元）"},
+})
+```
+
+### 查看表结构
+
+`describe()` 返回一个 DataFrame，包含字段名、物理类型、说明、是否主键：
+
+```python
+print(db.describe("daily_bar"))
+#     字段    物理类型          说明  是否主键
+# 0   date  BYTE_ARRAY      交易日期      True
+# 1   code  BYTE_ARRAY  股票代码（6位）     True
+# 2  close      DOUBLE   日收盘价（元）    False
+```
+
+## API 参考
+
+### `write_data(data, id, date_col="date", partitioning="年", unique_together=None, rewrite=True, schema=None)`
+
+将 DataFrame 写入存储。
+
+| 参数 | 说明 |
+|------|------|
+| `data` | 要写入的 DataFrame |
+| `id` | 表名 |
+| `date_col` | 日期列名，默认 `"date"` |
+| `partitioning` | 分区粒度：`"年"` / `"月"` / `"日"` / `None` |
+| `unique_together` | 主键列表，指定后自动去重；`None` 不去重 |
+| `rewrite` | `True` 保留最新数据（覆盖），`False` 保留旧数据 |
+| `schema` | 字段描述字典，如 `{"close": {"desc": "收盘价"}}` |
+
+### `query(sql)`
+
+执行 SQL 查询，返回 DuckDB 结果对象（调用 `.df()` 转为 DataFrame）。
+
+### `tables()`
+
+返回所有已注册的表名列表。
+
+### `describe(id)`
+
+返回指定表的字段描述 DataFrame（字段、物理类型、说明、是否主键）。
+
+### `set_schema(id, schema)`
+
+为已有表设置或更新字段描述，无需重新写入数据。
+
+### `delete(id)`
+
+删除指定表（数据文件、DuckDB 视图、配置）。
+
+### `close()`
+
+关闭 DuckDB 连接。也可通过 `with` 语句自动管理。
+
 ## License
 
 MIT
