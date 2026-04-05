@@ -85,7 +85,7 @@ class xxydb:
             date_col:         日期列名，默认 "date"
             partitioning:     分区粒度，"年" / "月" / "日" / None(不分区)
             unique_together:  主键列表，指定后自动去重；None 则不去重
-            rewrite:          True = 保留最新数据(覆盖)；False = 保留旧数据
+            rewrite:          True = 全量覆盖(删除旧数据后写入新数据)；False = 增量合并(有冲突时保留新值)
             schema:           字段描述，如 {"close": {"desc": "收盘价", "type": "float"}}
                               未提供时自动从 DataFrame 推断类型
         """
@@ -134,14 +134,16 @@ class xxydb:
 
     def _write_parquet(self, parquet_path, df_new, unique_together, rewrite):
         """写入单个 parquet 文件，处理合并去重。"""
-        if parquet_path.exists():
+        if rewrite or not parquet_path.exists():
+            # rewrite=True：全量覆盖，直接用新数据，不读旧数据
+            df_merged = df_new
+        else:
+            # rewrite=False：增量合并，新数据优先覆盖旧数据中的冲突行
             df_old = pd.read_parquet(parquet_path)
             if unique_together:
-                df_merged = self._merge_dedup(df_old, df_new, unique_together, rewrite)
+                df_merged = self._merge_dedup(df_old, df_new, unique_together)
             else:
                 df_merged = pd.concat([df_old, df_new], ignore_index=True)
-        else:
-            df_merged = df_new
 
         if unique_together:
             df_merged = df_merged.sort_values(unique_together).reset_index(drop=True)
@@ -386,17 +388,10 @@ class xxydb:
         df_old: pd.DataFrame,
         df_new: pd.DataFrame,
         keys: List[str],
-        rewrite: bool,
     ) -> pd.DataFrame:
-        """合并去重。rewrite=True 保留新数据，False 保留旧数据。"""
-        if rewrite:
-            # 新数据在后，drop_duplicates keep='last' 保留新的
-            merged = pd.concat([df_old, df_new], ignore_index=True)
-            return merged.drop_duplicates(subset=keys, keep="last")
-        else:
-            # 旧数据在前，drop_duplicates keep='first' 保留旧的
-            merged = pd.concat([df_old, df_new], ignore_index=True)
-            return merged.drop_duplicates(subset=keys, keep="first")
+        """合并去重。新数据在后，keep='last' 保留新数据（仅在 rewrite=False 时调用）。"""
+        merged = pd.concat([df_old, df_new], ignore_index=True)
+        return merged.drop_duplicates(subset=keys, keep="last")
 
     def _load_config(self) -> dict:
         if self._config_path.exists():
