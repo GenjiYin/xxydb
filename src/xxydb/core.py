@@ -38,9 +38,8 @@ class xxydb:
         self.base_dir.mkdir(parents=True, exist_ok=True)
 
         self._config_path = self.base_dir / "tables_config.json"
-        self._db_path = self.base_dir / "stock_database.duckdb"
         self._config = self._load_config()
-        self._con = duckdb.connect(str(self._db_path))
+        self._con = duckdb.connect()  # 内存连接，避免多进程文件锁冲突
         self._api_key = api_key
         self._base_url = base_url
         self._model = model
