@@ -201,9 +201,34 @@ df = db.ask("最近一个月日均成交量最大的股票")
 | `return_df` | `True` 返回 DataFrame，`False` 返回生成的 SQL 字符串 |
 | `model` | 模型名称，不传则使用构造函数中指定的模型 |
 
-### `query(sql)`
+### `query(sql, filters=None)`
 
 执行 SQL 查询，返回 DuckDB 结果对象（调用 `.df()` 转为 DataFrame）。
+
+`filters` 用于把列筛选条件一次性下推到所有引用了该列的表，无需在 SQL（尤其是多个 CTE 子句）里重复书写 `WHERE`。对按日期分区的表，时间条件还能触发分区裁剪，跳过范围外的 parquet 文件。
+
+值的类型决定筛选语义：
+
+| 值类型 | 含义 | 生成的条件 |
+|--------|------|-----------|
+| `tuple` `(起, 止)` | 区间，左闭右开 | `col >= 起 AND col < 止` |
+| `list` `[a, b]` | 枚举 | `col IN (a, b)` |
+| 标量 | 等值 | `col = 值` |
+
+区间任一端传 `None` 表示该端开放，如 `("2020-01-01", None)` 只限定起点。筛选只作用于实际包含该列的表，不含该列的表不受影响。
+
+```python
+# 取 2020 一整年的个股数据，CTE 里无需重复 WHERE date ...
+sql = """
+WITH ret AS (SELECT instrument, AVG(pct_change) m FROM bar GROUP BY instrument),
+     vol AS (SELECT instrument, STDDEV(pct_change) s FROM bar GROUP BY instrument)
+SELECT ret.instrument, ret.m, vol.s FROM ret JOIN vol USING(instrument)
+"""
+df = db.query(sql, filters={
+    "date": ("2020-01-01", "2021-01-01"),   # 左闭右开，正好 2020 全年
+    "instrument": ["000001", "000002"],     # 只看这两只
+})
+```
 
 ### `tables()`
 

@@ -262,6 +262,122 @@ class TestSchema:
         assert tmp_db._config["t"]["schema"]["code"]["desc"] == "股票代码"
 
 
+@pytest.fixture
+def panel_df():
+    """跨 2019-2021 的面板数据，多只股票。"""
+    return pd.DataFrame(
+        {
+            "date": pd.to_datetime(
+                ["2019-12-31", "2020-01-01", "2020-06-15",
+                 "2020-12-31", "2021-01-01", "2021-06-01"]
+            ),
+            "instrument": ["000001", "000001", "000002",
+                           "000001", "000002", "000001"],
+            "close": [9.0, 10.0, 20.0, 12.0, 21.0, 30.0],
+        }
+    )
+
+
+class TestQueryFilters:
+    def _write(self, db, df):
+        db.write_data(df, id="bar", date_col="date", partitioning="年",
+                      unique_together=["date", "instrument"])
+
+    def test_no_filters_regression(self, tmp_db, panel_df):
+        """不传 filters 时行为不变。"""
+        self._write(tmp_db, panel_df)
+        assert len(tmp_db.query("SELECT * FROM bar").df()) == 6
+
+    def test_tuple_range_left_closed_right_open(self, tmp_db, panel_df):
+        """tuple 区间，左闭右开，取 2020 整年。"""
+        self._write(tmp_db, panel_df)
+        r = tmp_db.query("SELECT * FROM bar",
+                         filters={"date": ("2020-01-01", "2021-01-01")}).df()
+        assert len(r) == 3
+        assert r["date"].min().strftime("%Y-%m-%d") == "2020-01-01"
+        assert r["date"].max().strftime("%Y-%m-%d") == "2020-12-31"
+
+    def test_list_in_enum(self, tmp_db, panel_df):
+        """list 值生成 IN 枚举。"""
+        self._write(tmp_db, panel_df)
+        r = tmp_db.query("SELECT * FROM bar",
+                         filters={"instrument": ["000002"]}).df()
+        assert len(r) == 2
+        assert set(r["instrument"]) == {"000002"}
+
+    def test_scalar_equals(self, tmp_db, panel_df):
+        """标量值生成等值条件。"""
+        self._write(tmp_db, panel_df)
+        r = tmp_db.query("SELECT * FROM bar",
+                         filters={"instrument": "000001"}).df()
+        assert len(r) == 4
+
+    def test_combined_filters(self, tmp_db, panel_df):
+        """区间 + 枚举组合。"""
+        self._write(tmp_db, panel_df)
+        r = tmp_db.query(
+            "SELECT * FROM bar",
+            filters={"date": ("2020-01-01", "2021-01-01"),
+                     "instrument": ["000001"]},
+        ).df()
+        assert len(r) == 2
+
+    def test_filter_applies_to_all_ctes(self, tmp_db, panel_df):
+        """filters 下推到视图，多个 CTE 子句无需重复 WHERE。"""
+        self._write(tmp_db, panel_df)
+        sql = """
+            WITH a AS (SELECT instrument, AVG(close) avg_c FROM bar GROUP BY instrument),
+                 b AS (SELECT instrument, MAX(close) max_c FROM bar GROUP BY instrument)
+            SELECT a.instrument, a.avg_c, b.max_c
+            FROM a JOIN b USING(instrument) ORDER BY instrument
+        """
+        r = tmp_db.query(sql, filters={"date": ("2020-01-01", "2021-01-01")}).df()
+        # 只应统计 2020 的 3 行
+        row1 = r[r["instrument"] == "000001"].iloc[0]
+        assert row1["avg_c"] == pytest.approx(11.0)
+        assert row1["max_c"] == pytest.approx(12.0)
+
+    def test_open_ended_range(self, tmp_db, panel_df):
+        """区间端点为 None 表示该端开放。"""
+        self._write(tmp_db, panel_df)
+        r = tmp_db.query("SELECT * FROM bar",
+                         filters={"date": ("2021-01-01", None)}).df()
+        assert len(r) == 2
+
+    def test_view_restored_after_filtered_query(self, tmp_db, panel_df):
+        """filters 查询后视图应还原为无过滤状态。"""
+        self._write(tmp_db, panel_df)
+        tmp_db.query("SELECT * FROM bar",
+                     filters={"date": ("2020-01-01", "2021-01-01")}).df()
+        assert len(tmp_db.query("SELECT * FROM bar").df()) == 6
+
+    def test_missing_column_ignored(self, tmp_db, panel_df):
+        """filters 中表里不存在的列被忽略。"""
+        self._write(tmp_db, panel_df)
+        db2 = tmp_db
+        db2.write_data(pd.DataFrame({"date": pd.to_datetime(["2020-05-01"]),
+                                     "val": [1]}),
+                       id="other", date_col="date", partitioning="年")
+        # other 表没有 instrument 列，filters 不应影响它
+        r = db2.query("SELECT * FROM other",
+                      filters={"instrument": ["000001"]}).df()
+        assert len(r) == 1
+
+    def test_filter_value_escaped(self, tmp_db, panel_df):
+        """filters 值中的引号被转义，注入失效。"""
+        self._write(tmp_db, panel_df)
+        r = tmp_db.query("SELECT * FROM bar",
+                         filters={"instrument": ["x' OR '1'='1"]}).df()
+        assert len(r) == 0
+
+    def test_empty_list_no_results(self, tmp_db, panel_df):
+        """空枚举列表返回空结果。"""
+        self._write(tmp_db, panel_df)
+        r = tmp_db.query("SELECT * FROM bar",
+                         filters={"instrument": []}).df()
+        assert len(r) == 0
+
+
 class TestErrors:
     def test_missing_date_col(self, tmp_db):
         df = pd.DataFrame({"not_date": ["2024-01-01"], "v": [1]})

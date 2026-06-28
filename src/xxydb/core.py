@@ -152,12 +152,49 @@ class xxydb:
         df_merged.to_parquet(parquet_path, index=False, compression="zstd")
         print(f"  [写入] {parquet_path}  ({len(df_merged)} 行)")
 
-    def query(self, sql: str):
+    def query(self, sql: str, filters: Optional[dict] = None):
         """
         执行 SQL 查询，返回 DuckDB 的结果对象。
         调用 .df() 可转为 pandas DataFrame。
+
+        参数:
+            sql:      SQL 查询语句
+            filters:  列筛选条件字典，会自动下推到所有引用了该列的表，
+                      无需在 SQL（含每个 CTE 子句）里重复书写 WHERE。
+
+                      值的类型决定筛选语义：
+                        - tuple (起, 止)：区间，左闭右开，即 col >= 起 AND col < 止
+                                          任一端传 None 表示该端开放，如 ("2020-01-01", None)
+                        - list  [a, b]   ：枚举，即 col IN (a, b)
+                        - 标量            ：等值，即 col = 值
+
+                      示例：
+                        db.query("WITH t AS (...) SELECT ...", filters={
+                            "date": ("2020-01-01", "2021-01-01"),  # 取 2020 一整年
+                            "instrument": ["000001", "000002"],
+                        })
+
+                      筛选只作用于实际包含该列的表，不含该列的表不受影响。
         """
-        return self._con.execute(sql)
+        if not filters:
+            return self._con.execute(sql)
+
+        affected = []
+        try:
+            for table_id in self._config:
+                if not (self.base_dir / table_id).exists():
+                    continue
+                cols = self._table_columns(table_id)
+                where = self._build_filter_where(filters, cols)
+                if where:
+                    self._create_view(table_id, where_clause=where)
+                    affected.append(table_id)
+            # 完整物化结果，避免还原视图后惰性取数读到已还原的视图
+            arrow_tbl = self._con.execute(sql).fetch_arrow_table()
+        finally:
+            for table_id in affected:
+                self._create_view(table_id)
+        return self._con.from_arrow(arrow_tbl)
 
     def tables(self) -> list:
         """返回已注册的所有表名列表。"""
@@ -427,8 +464,68 @@ class xxydb:
             self._config[table_id]["schema"] = existing
         self._save_config()
 
-    def _create_view(self, table_id: str):
-        """为指定表创建/刷新 DuckDB 视图。"""
+    def _table_columns(self, table_id: str) -> List[str]:
+        """返回某张表的原始列名（不含 hive 分区列）。"""
+        folder = self.base_dir / table_id
+        sample = next(folder.rglob("*.parquet"), None)
+        if sample is None:
+            return []
+        sample_path = str(sample).replace("\\", "/")
+        cols = self._con.execute(
+            f"SELECT name FROM parquet_schema('{sample_path}') "
+            "WHERE num_children IS NULL"
+        ).fetchall()
+        return [c[0] for c in cols]
+
+    @staticmethod
+    def _sql_literal(value) -> str:
+        """把 Python 值转为安全的 SQL 字面量（数字裸写，其余加引号并转义）。"""
+        if value is None:
+            return "NULL"
+        if isinstance(value, bool):
+            return "TRUE" if value else "FALSE"
+        if isinstance(value, (int, float)):
+            return str(value)
+        escaped = str(value).replace("'", "''")
+        return f"'{escaped}'"
+
+    @classmethod
+    def _build_filter_where(cls, filters: dict, cols: List[str]) -> str:
+        """
+        根据 filters 字典和表的实际列，构造 WHERE 条件（不含 WHERE 关键字）。
+        只对表中真实存在的列生成条件，其它列忽略。
+
+        值语义：
+            tuple (起, 止) -> 区间，左闭右开；端点为 None 时该端开放
+            list  [...]    -> IN 枚举
+            其它标量        -> 等值
+        """
+        conds = []
+        for col, val in filters.items():
+            if col not in cols:
+                continue
+            qcol = f'"{col}"'
+            if isinstance(val, tuple):
+                lo, hi = val
+                if lo is not None:
+                    conds.append(f"{qcol} >= {cls._sql_literal(lo)}")
+                if hi is not None:
+                    conds.append(f"{qcol} < {cls._sql_literal(hi)}")
+            elif isinstance(val, list):
+                if not val:
+                    conds.append("FALSE")  # 空枚举 -> 无结果
+                else:
+                    items = ", ".join(cls._sql_literal(v) for v in val)
+                    conds.append(f"{qcol} IN ({items})")
+            else:
+                conds.append(f"{qcol} = {cls._sql_literal(val)}")
+        return " AND ".join(conds)
+
+    def _create_view(self, table_id: str, where_clause: Optional[str] = None):
+        """为指定表创建/刷新 DuckDB 视图。
+
+        where_clause 非空时，在视图定义里附加过滤条件（用于 query 的 filters 下推）。
+        """
         folder = self.base_dir / table_id
         glob_pattern = str(folder / "**" / "*.parquet").replace("\\", "/")
 
@@ -438,6 +535,8 @@ class xxydb:
 
         cfg = self._config.get(table_id, {})
         part_key = cfg.get("partition_by")
+
+        where_sql = f"\n                WHERE {where_clause}" if where_clause else ""
 
         if part_key:
             # 有分区：开启 hive_partitioning，但只 SELECT 原始列
@@ -453,7 +552,7 @@ class xxydb:
                     '{glob_pattern}',
                     hive_partitioning = true,
                     union_by_name = true
-                );
+                ){where_sql};
             """
         else:
             # 无分区：直接读取
@@ -462,7 +561,7 @@ class xxydb:
                 SELECT * FROM read_parquet(
                     '{glob_pattern}',
                     union_by_name = true
-                );
+                ){where_sql};
             """
         self._con.execute(sql)
 
