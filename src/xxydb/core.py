@@ -163,14 +163,14 @@ class xxydb:
                       无需在 SQL（含每个 CTE 子句）里重复书写 WHERE。
 
                       值的类型决定筛选语义：
-                        - tuple (起, 止)：区间，左闭右开，即 col >= 起 AND col < 止
+                        - tuple (起, 止)：区间，双闭（含两端），即 col >= 起 AND col <= 止
                                           任一端传 None 表示该端开放，如 ("2020-01-01", None)
                         - list  [a, b]   ：枚举，即 col IN (a, b)
                         - 标量            ：等值，即 col = 值
 
                       示例：
                         db.query("WITH t AS (...) SELECT ...", filters={
-                            "date": ("2020-01-01", "2021-01-01"),  # 取 2020 一整年
+                            "date": ("2020-01-01", "2020-12-31"),  # 取 2020 一整年
                             "instrument": ["000001", "000002"],
                         })
 
@@ -496,7 +496,7 @@ class xxydb:
         只对表中真实存在的列生成条件，其它列忽略。
 
         值语义：
-            tuple (起, 止) -> 区间，左闭右开；端点为 None 时该端开放
+            tuple (起, 止) -> 区间，双闭（含两端）；端点为 None 时该端开放
             list  [...]    -> IN 枚举
             其它标量        -> 等值
         """
@@ -510,7 +510,7 @@ class xxydb:
                 if lo is not None:
                     conds.append(f"{qcol} >= {cls._sql_literal(lo)}")
                 if hi is not None:
-                    conds.append(f"{qcol} < {cls._sql_literal(hi)}")
+                    conds.append(f"{qcol} <= {cls._sql_literal(hi)}")
             elif isinstance(val, list):
                 if not val:
                     conds.append("FALSE")  # 空枚举 -> 无结果

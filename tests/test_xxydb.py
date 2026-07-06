@@ -288,14 +288,25 @@ class TestQueryFilters:
         self._write(tmp_db, panel_df)
         assert len(tmp_db.query("SELECT * FROM bar").df()) == 6
 
-    def test_tuple_range_left_closed_right_open(self, tmp_db, panel_df):
-        """tuple 区间，左闭右开，取 2020 整年。"""
+    def test_tuple_range_closed(self, tmp_db, panel_df):
+        """tuple 区间双闭，取 2020 整年。"""
         self._write(tmp_db, panel_df)
         r = tmp_db.query("SELECT * FROM bar",
-                         filters={"date": ("2020-01-01", "2021-01-01")}).df()
+                         filters={"date": ("2020-01-01", "2020-12-31")}).df()
         assert len(r) == 3
         assert r["date"].min().strftime("%Y-%m-%d") == "2020-01-01"
         assert r["date"].max().strftime("%Y-%m-%d") == "2020-12-31"
+
+    def test_tuple_range_includes_both_ends(self, tmp_db, panel_df):
+        """双闭区间的两个端点都应被包含。"""
+        self._write(tmp_db, panel_df)
+        # 起、止均为数据中实际存在的日期，双闭下两端都应取到
+        r = tmp_db.query("SELECT * FROM bar",
+                         filters={"date": ("2020-06-15", "2021-01-01")}).df()
+        dates = set(r["date"].dt.strftime("%Y-%m-%d"))
+        assert "2020-06-15" in dates   # 左端点，含
+        assert "2021-01-01" in dates   # 右端点，含
+        assert dates == {"2020-06-15", "2020-12-31", "2021-01-01"}
 
     def test_list_in_enum(self, tmp_db, panel_df):
         """list 值生成 IN 枚举。"""
@@ -317,7 +328,7 @@ class TestQueryFilters:
         self._write(tmp_db, panel_df)
         r = tmp_db.query(
             "SELECT * FROM bar",
-            filters={"date": ("2020-01-01", "2021-01-01"),
+            filters={"date": ("2020-01-01", "2020-12-31"),
                      "instrument": ["000001"]},
         ).df()
         assert len(r) == 2
@@ -331,7 +342,7 @@ class TestQueryFilters:
             SELECT a.instrument, a.avg_c, b.max_c
             FROM a JOIN b USING(instrument) ORDER BY instrument
         """
-        r = tmp_db.query(sql, filters={"date": ("2020-01-01", "2021-01-01")}).df()
+        r = tmp_db.query(sql, filters={"date": ("2020-01-01", "2020-12-31")}).df()
         # 只应统计 2020 的 3 行
         row1 = r[r["instrument"] == "000001"].iloc[0]
         assert row1["avg_c"] == pytest.approx(11.0)
@@ -348,7 +359,7 @@ class TestQueryFilters:
         """filters 查询后视图应还原为无过滤状态。"""
         self._write(tmp_db, panel_df)
         tmp_db.query("SELECT * FROM bar",
-                     filters={"date": ("2020-01-01", "2021-01-01")}).df()
+                     filters={"date": ("2020-01-01", "2020-12-31")}).df()
         assert len(tmp_db.query("SELECT * FROM bar").df()) == 6
 
     def test_missing_column_ignored(self, tmp_db, panel_df):

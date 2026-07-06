@@ -211,7 +211,7 @@ df = db.ask("最近一个月日均成交量最大的股票")
 
 | 值类型 | 含义 | 生成的条件 |
 |--------|------|-----------|
-| `tuple` `(起, 止)` | 区间，左闭右开 | `col >= 起 AND col < 止` |
+| `tuple` `(起, 止)` | 区间，双闭（含两端） | `col >= 起 AND col <= 止` |
 | `list` `[a, b]` | 枚举 | `col IN (a, b)` |
 | 标量 | 等值 | `col = 值` |
 
@@ -225,7 +225,7 @@ WITH ret AS (SELECT instrument, AVG(pct_change) m FROM bar GROUP BY instrument),
 SELECT ret.instrument, ret.m, vol.s FROM ret JOIN vol USING(instrument)
 """
 df = db.query(sql, filters={
-    "date": ("2020-01-01", "2021-01-01"),   # 左闭右开，正好 2020 全年
+    "date": ("2020-01-01", "2020-12-31"),   # 双闭，含两端，正好 2020 全年
     "instrument": ["000001", "000002"],     # 只看这两只
 })
 ```
