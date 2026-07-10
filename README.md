@@ -230,6 +230,52 @@ df = db.query(sql, filters={
 })
 ```
 
+## 内置 SQL 算子
+
+初始化 `xxydb` 后，连接中自动注册了若干可在 `query()` 里直接调用的算子，无需自己定义。
+
+### `neutralize` — 因子中性化（市值 + 行业等）
+
+对因子做横截面 OLS 回归、剥离连续变量（如市值）与离散变量（如行业）的影响，取残差作为「纯净」因子。基于 FWL 定理用纯窗口函数实现，与完整多元 OLS 残差逐元素相等（非近似，仅 ~1e-12 级浮点舍入）。
+
+这是一个**表算子**，写在 `FROM` 里，输出原表所有列 + 一列 `factor_neutral`：
+
+```python
+sql = """
+WITH t1 AS (
+    SELECT d.date, d.instrument,
+           d.close                    AS factor,      -- 待中性化的因子
+           LN(v.total_market_cap)     AS ln_mcap,     -- 连续控制变量
+           i.industry_level1_name     AS industry     -- 离散控制变量
+    FROM daily_bar d
+    JOIN valuation v USING(date, instrument)
+    JOIN stock_industry_component i USING(date, instrument)
+    WHERE v.total_market_cap > 0 AND d.close IS NOT NULL
+      AND i.industry_level1_name IS NOT NULL
+)
+SELECT date, instrument, factor_neutral
+FROM neutralize('t1', factor, ln_mcap, industry, date)
+"""
+df = db.query(sql).df()
+```
+
+参数：
+
+| 参数 | 说明 |
+|------|------|
+| `tbl` | 输入表名字符串（可以是外层 `WITH` 定义的 CTE 名，如 `'t1'`） |
+| `y` | 因子列（被中性化） |
+| `x1` | 连续控制变量列（如 `LN(市值)`） |
+| `x2` | 离散控制变量列（行业名，字符或数字皆可，须离散） |
+| `grp` | 截面分组键（通常是 `date`，逐日截面各自中性化） |
+
+注意：
+
+- 第一个参数是**表名字符串**（DuckDB 表算子只接表名、不接子查询）；取数逻辑写在外层 `WITH`，把 CTE 名字符串传进来即可。
+- 只支持**一个**连续控制变量；再加连续变量需矩阵求逆，超出纯 SQL 能力，应转 Python。
+- 传入前应过滤 `y` / `x1` / `x2` 的 NULL，否则会污染组均值。
+- 某截面 `x1` 在各组内方差全为 0 时，该日残差置 NULL（行为明确，不静默出错）。
+
 ### `tables()`
 
 返回所有已注册的表名列表。

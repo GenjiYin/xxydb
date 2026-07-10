@@ -44,6 +44,9 @@ class xxydb:
         self._base_url = base_url
         self._model = model
 
+        # 注册内置 SQL 算子（中性化等），随连接生效
+        self._register_macros()
+
         # 启动时为已有表创建视图
         self._refresh_all_views()
 
@@ -571,3 +574,52 @@ class xxydb:
             folder = self.base_dir / table_id
             if folder.exists():
                 self._create_view(table_id)
+
+    def _register_macros(self):
+        """注册内置 SQL 算子（随连接生效，query 中可直接调用）。
+
+        —— neutralize：因子中性化（市值 + 行业等）——
+        原理为 FWL 定理：对「任意个离散哑变量 + 至多一个连续控制变量」，
+        「组内去均值 + 截面过原点一元回归取残差」与完整多元 OLS 残差逐元素相等
+        （非近似，仅有 ~1e-12 级浮点舍入）。是表算子（table macro），作用在整张
+        （子）表上，输出原表所有列 + 一列 factor_neutral（中性化后的因子）。
+
+        参数：
+          tbl  : 输入表名字符串（可以是外层 WITH 定义的 CTE 名，如 't1'）
+          y    : 因子列（被中性化）
+          x1   : 连续控制变量列（如 LN(市值)）
+          x2   : 离散控制变量列（行业名，字符或数字皆可，须离散）
+          grp  : 截面分组键（通常是 date，逐日截面各自中性化）
+
+        典型用法（逐日截面，对市值 + 行业中性化）：
+
+            WITH t1 AS (
+                SELECT date, instrument, factor, ln_mcap, industry FROM ...
+            )
+            SELECT date, instrument, factor_neutral
+            FROM neutralize('t1', factor, ln_mcap, industry, date)
+
+        注意：
+          - 第一个参数是表名字符串（DuckDB 表算子只接表名，不接子查询）；
+            取数逻辑写在外层 WITH，把 CTE 名字符串传进来即可。
+          - 只支持一个连续控制变量；再加连续变量需矩阵求逆，超出纯 SQL 能力。
+          - 传入前应过滤 y / x1 / x2 的 NULL，否则会污染组均值。
+          - 某截面 x1 在各组内方差全为 0 时，NULLIF 使该日残差置 NULL（行为明确）。
+        """
+        self._con.execute(
+            """
+            CREATE OR REPLACE MACRO neutralize(tbl, y, x1, x2, grp) AS TABLE
+            WITH _dm AS (
+                SELECT *,
+                    (y)  - AVG(y)  OVER (PARTITION BY grp, x2) AS _f_dm,
+                    (x1) - AVG(x1) OVER (PARTITION BY grp, x2) AS _x_dm
+                FROM query_table(tbl)
+            )
+            SELECT * EXCLUDE (_f_dm, _x_dm),
+                _f_dm - (
+                    SUM(_f_dm * _x_dm) OVER (PARTITION BY grp)
+                    / NULLIF(SUM(_x_dm * _x_dm) OVER (PARTITION BY grp), 0)
+                ) * _x_dm AS factor_neutral
+            FROM _dm;
+            """
+        )

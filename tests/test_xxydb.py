@@ -399,3 +399,57 @@ class TestErrors:
         df = pd.DataFrame({"date": ["2024-01-01"], "v": [1]})
         with pytest.raises(ValueError, match="不支持的分区粒度"):
             tmp_db.write_data(df, id="err", date_col="date", partitioning="周")
+
+
+class TestNeutralize:
+    """内置 neutralize 中性化算子。"""
+
+    def test_matches_known_answer(self, tmp_db):
+        """5 股票 2 行业的教科书例子，残差应为已知的 [0.8,-2,1.2,0.4,-0.4]。"""
+        con = tmp_db._con
+        con.execute(
+            """CREATE TABLE base AS SELECT * FROM (VALUES
+                ('d1', '1', 'A', 10.0, 2.0),
+                ('d1', '2', 'A', 12.0, 4.0),
+                ('d1', '3', 'A', 20.0, 6.0),
+                ('d1', '4', 'B',  5.0, 1.0),
+                ('d1', '5', 'B',  9.0, 3.0)
+            ) t(date, inst, industry, factor, mcap);"""
+        )
+        r = con.execute(
+            """SELECT inst, factor_neutral
+               FROM neutralize('base', factor, mcap, industry, date)
+               ORDER BY inst"""
+        ).df()
+        assert r["factor_neutral"].round(6).tolist() == [0.8, -2.0, 1.2, 0.4, -0.4]
+
+    def test_matches_full_ols(self, tmp_db):
+        """随机面板下与 numpy 完整多元 OLS 残差逐元素相等。"""
+        np = pytest.importorskip("numpy")
+        rng = np.random.default_rng(0)
+        n = 200
+        rows = []
+        for d in ["d1", "d2"]:
+            ind = rng.integers(0, 6, n)
+            mc = rng.uniform(1, 10, n)
+            fac = rng.standard_normal(n) * 5 + ind * 0.3 + mc * 1.7
+            for i in range(n):
+                rows.append((d, i, int(ind[i]), float(mc[i]), float(fac[i])))
+        df = pd.DataFrame(rows, columns=["date", "inst", "industry", "mcap", "factor"])
+        con = tmp_db._con
+        con.register("panel", df)
+        res = con.execute(
+            """SELECT date, inst, factor_neutral
+               FROM neutralize('panel', factor, mcap, industry, date)"""
+        ).df()
+
+        def ols(g):
+            D = pd.get_dummies(g["industry"].astype(str)).astype(float).values
+            X = np.column_stack([D, g["mcap"].values])
+            y = g["factor"].values
+            c, *_ = np.linalg.lstsq(X, y, rcond=None)
+            return pd.Series(y - X @ c, index=g.index)
+
+        df["ref"] = df.groupby("date", group_keys=False).apply(ols)
+        m = res.merge(df[["date", "inst", "ref"]], on=["date", "inst"])
+        assert (m["factor_neutral"] - m["ref"]).abs().max() < 1e-8
