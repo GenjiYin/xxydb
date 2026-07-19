@@ -276,6 +276,44 @@ df = db.query(sql).df()
 - 传入前应过滤 `y` / `x1` / `x2` 的 NULL，否则会污染组均值。
 - 某截面 `x1` 在各组内方差全为 0 时，该日残差置 NULL（行为明确，不静默出错）。
 
+### `neutralize_group` — 仅分类中性化（如只做行业）
+
+只对**一个离散变量**（如行业）做横截面中性化，不含市值等连续变量。数学上等价于「只用行业哑变量做截面 OLS 取残差」，也就是**因子在行业组内去均值**——这正是 `neutralize` 第一步「组内去均值」的精确解（FWL 定理离散退化情形，非近似）。因为没有连续变量，`neutralize` 的第二步过原点回归整个省去。
+
+同样是**表算子**，输出原表所有列 + 一列 `factor_neutral`：
+
+```python
+sql = """
+WITH t1 AS (
+    SELECT
+        d.date, d.instrument,
+        (d.close - d.open) / d.open AS factor,
+        i.industry_level1_name       AS industry
+    FROM daily d
+    JOIN industry i USING (date, instrument)
+    WHERE i.industry_level1_name IS NOT NULL
+)
+SELECT date, instrument, factor_neutral
+FROM neutralize_group('t1', factor, industry, date)
+"""
+df = db.query(sql).df()
+```
+
+参数：
+
+| 参数 | 说明 |
+|------|------|
+| `tbl` | 输入表名字符串（可以是外层 `WITH` 定义的 CTE 名，如 `'t1'`） |
+| `y` | 因子列（被中性化） |
+| `cat` | 分类控制变量列（行业名，字符或数字皆可，须离散） |
+| `grp` | 截面分组键（通常是 `date`，逐日截面各自中性化） |
+
+注意：
+
+- 只接**一个**分类变量，以保证结果精确等于 OLS。若需对两个分类变量做中性化，自行 `concat(cat1, cat2)` 成组合键传入——这等价于**完全交叉**固定效应，而非可加双因子（后者需组内迭代变换，纯 SQL 一步做不到）。
+- 传入前应过滤 `y` / `cat` 的 NULL，否则会污染组均值。
+- 某组只含 1 行时，该行残差恒为 0（组均值即自身，行为明确）。
+
 ### `tables()`
 
 返回所有已注册的表名列表。

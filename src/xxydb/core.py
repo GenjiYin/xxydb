@@ -623,3 +623,36 @@ class xxydb:
             FROM _dm;
             """
         )
+        # —— neutralize_group：仅行业（离散变量）中性化 ——
+        # neutralize 的第一步「组内去均值」本身就是「只用离散哑变量做截面 OLS
+        # 取残差」的精确解（FWL 定理离散退化情形，非近似）。仅行业中性化时
+        # 无连续变量，第二步过原点回归整个省去，残差直接等于组内去均值。
+        #
+        # 参数：
+        #   tbl  : 输入表名字符串（同 neutralize，接外层 WITH 定义的 CTE 名）
+        #   y    : 因子列（被中性化）
+        #   cat  : 分类控制变量列（行业名，字符或数字皆可，须离散）
+        #   grp  : 截面分组键（通常是 date，逐日截面各自中性化）
+        #
+        # 典型用法（逐日截面，仅对行业中性化）：
+        #
+        #     WITH t1 AS (
+        #         SELECT date, instrument, factor, industry FROM ...
+        #     )
+        #     SELECT date, instrument, factor_neutral
+        #     FROM neutralize_group('t1', factor, industry, date)
+        #
+        # 注意：
+        #   - 只接「一个」分类变量，保证结果精确等于 OLS。若需对两个分类变量
+        #     「完全交叉」中性化，自行 concat(cat1, cat2) 成组合键传入；这等价
+        #     于完全交叉固定效应，而非可加双因子（后者纯 SQL 一步做不到）。
+        #   - 传入前应过滤 y / cat 的 NULL，否则会污染组均值。
+        #   - 某组只含 1 行时，该行残差恒为 0（组均值即自身，行为明确）。
+        self._con.execute(
+            """
+            CREATE OR REPLACE MACRO neutralize_group(tbl, y, cat, grp) AS TABLE
+            SELECT *,
+                (y) - AVG(y) OVER (PARTITION BY grp, cat) AS factor_neutral
+            FROM query_table(tbl);
+            """
+        )

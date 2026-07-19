@@ -453,3 +453,57 @@ class TestNeutralize:
         df["ref"] = df.groupby("date", group_keys=False).apply(ols)
         m = res.merge(df[["date", "inst", "ref"]], on=["date", "inst"])
         assert (m["factor_neutral"] - m["ref"]).abs().max() < 1e-8
+
+
+class TestNeutralizeGroup:
+    """内置 neutralize_group 仅分类（行业）中性化算子。"""
+
+    def test_matches_known_answer(self, tmp_db):
+        """仅行业中性化 = 组内去均值。
+        A 组 [1,3] 均值 2 → [-1,1]；B 组 [4,8,6] 均值 6 → [-2,2,0]。"""
+        con = tmp_db._con
+        con.execute(
+            """CREATE OR REPLACE TABLE base AS
+               SELECT * FROM (VALUES
+                ('d1', '1', 'A', 1.0),
+                ('d1', '2', 'A', 3.0),
+                ('d1', '3', 'B', 4.0),
+                ('d1', '4', 'B', 8.0),
+                ('d1', '5', 'B', 6.0)
+               ) t(date, inst, industry, factor);"""
+        )
+        r = con.execute(
+            """SELECT inst, factor_neutral
+               FROM neutralize_group('base', factor, industry, date)
+               ORDER BY inst"""
+        ).df()
+        assert r["factor_neutral"].round(6).tolist() == [-1.0, 1.0, -2.0, 2.0, 0.0]
+
+    def test_matches_industry_only_ols(self, tmp_db):
+        """随机面板下与 numpy 仅行业哑变量 OLS 残差逐元素相等。"""
+        np = pytest.importorskip("numpy")
+        rng = np.random.default_rng(0)
+        n = 200
+        rows = []
+        for d in ["d1", "d2"]:
+            ind = rng.integers(0, 6, n)
+            fac = rng.standard_normal(n) * 5 + ind * 0.3
+            for i in range(n):
+                rows.append((d, i, int(ind[i]), float(fac[i])))
+        df = pd.DataFrame(rows, columns=["date", "inst", "industry", "factor"])
+        con = tmp_db._con
+        con.register("panel", df)
+        res = con.execute(
+            """SELECT date, inst, factor_neutral
+               FROM neutralize_group('panel', factor, industry, date)"""
+        ).df()
+
+        def ols(g):
+            X = pd.get_dummies(g["industry"].astype(str)).astype(float).values
+            y = g["factor"].values
+            c, *_ = np.linalg.lstsq(X, y, rcond=None)
+            return pd.Series(y - X @ c, index=g.index)
+
+        df["ref"] = df.groupby("date", group_keys=False).apply(ols)
+        m = res.merge(df[["date", "inst", "ref"]], on=["date", "inst"])
+        assert (m["factor_neutral"] - m["ref"]).abs().max() < 1e-8
